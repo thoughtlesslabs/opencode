@@ -212,7 +212,7 @@ export namespace SessionPrompt {
   function start(sessionID: string) {
     const s = state()
     if (s[sessionID]) return
-    const loopId = Identifier.ascending("loop")
+    const loopId = ulid()
     const controller = new AbortController()
     s[sessionID] = {
       abort: controller,
