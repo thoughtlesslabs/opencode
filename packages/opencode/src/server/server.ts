@@ -864,6 +864,37 @@ export namespace Server {
         },
       )
       .post(
+        "/session/:sessionID/queue/:messageID/cancel",
+        describeRoute({
+          summary: "Cancel queued message",
+          description: "Cancel a queued message that is waiting to be processed.",
+          operationId: "session.cancelQueued",
+          responses: {
+            200: {
+              description: "Message cancelled",
+              content: {
+                "application/json": {
+                  schema: resolver(z.boolean()),
+                },
+              },
+            },
+            ...errors(400, 404),
+          },
+        }),
+        validator(
+          "param",
+          z.object({
+            sessionID: z.string(),
+            messageID: z.string(),
+          }),
+        ),
+        async (c) => {
+          const { sessionID, messageID } = c.req.valid("param")
+          const result = SessionPrompt.cancelQueuedMessage(sessionID, messageID)
+          return c.json(result)
+        },
+      )
+      .post(
         "/session/:sessionID/share",
         describeRoute({
           summary: "Share session",
