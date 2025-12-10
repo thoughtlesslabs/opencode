@@ -5,7 +5,6 @@ import { useSDK } from "@tui/context/sdk"
 import { useRoute } from "@tui/context/route"
 import { Clipboard } from "@tui/util/clipboard"
 import type { PromptInfo } from "@tui/component/prompt/history"
-import { SessionPrompt } from "@/session/prompt"
 
 export function DialogMessage(props: {
   messageID: string
@@ -17,8 +16,15 @@ export function DialogMessage(props: {
   const message = createMemo(() => sync.data.message[props.sessionID]?.find((x) => x.id === props.messageID))
   const route = useRoute()
 
-  // Check if this message is queued (has no assistant response yet)
+  // Check if there's currently a pending assistant message (task in progress)
+  const pending = createMemo(() => {
+    const allMessages = sync.data.message[props.sessionID] ?? []
+    return allMessages.find((x) => x.role === "assistant" && !x.time.completed)
+  })
+
+  // Check if this message is queued (has no assistant response yet and there's a pending task)
   const isQueued = createMemo(() => {
+    if (!pending()) return false
     const msg = message()
     if (!msg || msg.role !== "user") return false
     const allMessages = sync.data.message[props.sessionID] ?? []
@@ -26,25 +32,34 @@ export function DialogMessage(props: {
     return !hasResponse
   })
 
-  // Find the queue position for this message (1-indexed)
+  // Find all queued messages and this message's position (1-indexed)
   const queuePosition = createMemo(() => {
     if (!isQueued()) return 0
-    const queuedIds = SessionPrompt.getQueuedMessageIds(props.sessionID)
-    const index = queuedIds.indexOf(props.messageID)
+    const allMessages = sync.data.message[props.sessionID] ?? []
+    // Get all user messages that have no assistant response (queued)
+    const queuedMessages = allMessages.filter((m) => {
+      if (m.role !== "user") return false
+      return !allMessages.some((other) => other.role === "assistant" && other.parentID === m.id)
+    })
+    const index = queuedMessages.findIndex((m) => m.id === props.messageID)
     return index >= 0 ? index + 1 : 0
   })
 
   const options = createMemo(() => {
     const opts: DialogSelectOption[] = []
 
-    // Add cancel option for queued messages
+    // Add cancel option for queued messages - uses revert to remove from queue
     if (isQueued() && queuePosition() > 0) {
       opts.push({
         title: "Cancel",
         value: "queue.cancel",
         description: "remove from queue",
         onSelect: (dialog) => {
-          SessionPrompt.cancelQueued(props.sessionID, queuePosition())
+          // Revert this message to remove it from the queue
+          sdk.client.session.revert({
+            sessionID: props.sessionID,
+            messageID: props.messageID,
+          })
           dialog.clear()
         },
       })
