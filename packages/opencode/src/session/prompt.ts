@@ -243,33 +243,6 @@ export namespace SessionPrompt {
     }
   }
 
-  // Cancel a specific queued message by its position in the queue (1-indexed)
-  export function cancelQueued(sessionID: string, queuePosition: number): boolean {
-    log.info("cancelQueued", { sessionID, queuePosition })
-    const s = state()
-    const match = s[sessionID]
-    if (!match) return false
-
-    const index = queuePosition - 1 // Convert 1-indexed to 0-indexed
-    if (index < 0 || index >= match.callbacks.length) return false
-
-    // Remove the callback at the specified position
-    const [removed] = match.callbacks.splice(index, 1)
-    if (removed) {
-      removed.reject()
-      return true
-    }
-    return false
-  }
-
-  // Get the list of queued message IDs for a session
-  export function getQueuedMessageIds(sessionID: string): string[] {
-    const s = state()
-    const match = s[sessionID]
-    if (!match) return []
-    return match.callbacks.map((cb) => cb.userMessageID)
-  }
-
   // Process queued callbacks one at a time, ensuring messages are handled in order.
   // Remaining callbacks are added to state so they remain visible as "queued" in the UI.
   function processQueuedCallbacks(
