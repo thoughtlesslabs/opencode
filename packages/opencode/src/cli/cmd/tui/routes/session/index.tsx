@@ -109,6 +109,53 @@ export function Session() {
     return messages().findLast((x) => x.role === "assistant" && !x.time.completed)?.id
   })
 
+  // The user message currently being processed (parent of the pending assistant)
+  const currentUserMessageId = createMemo(() => {
+    const pendingId = pending()
+    if (!pendingId) return null
+    const pendingMsg = messages().find((m) => m.id === pendingId)
+    if (!pendingMsg || pendingMsg.role !== "assistant") return null
+    return pendingMsg.parentID
+  })
+
+  // Queued messages: user messages with no response yet, shown only when there's a pending task
+  // These are visually separated and pinned to the bottom so they don't interrupt the current task
+  const queuedMessages = createMemo(() => {
+    if (!pending()) return [] // No pending task, no visual queue
+    return messages().filter((m) => {
+      if (m.role !== "user") return false
+      // User message is queued if it has no assistant response at all
+      return !messages().some((other) => other.role === "assistant" && other.parentID === m.id)
+    })
+  })
+
+  // Active messages: all messages except queued ones, with current task at the end
+  // This ensures that when a message leaves the queue, it appears at the bottom of the scrollbox
+  const activeMessages = createMemo(() => {
+    const queuedIds = new Set(queuedMessages().map((m) => m.id))
+    const currentUserId = currentUserMessageId()
+    const active = messages().filter((m) => !queuedIds.has(m.id))
+
+    if (!currentUserId) return active
+
+    // Separate completed messages from the currently processing conversation
+    const completed: typeof active = []
+    const current: typeof active = []
+
+    for (const m of active) {
+      if (m.role === "user" && m.id === currentUserId) {
+        current.push(m)
+      } else if (m.role === "assistant" && m.parentID === currentUserId) {
+        current.push(m)
+      } else {
+        completed.push(m)
+      }
+    }
+
+    // Return completed conversations first, then current task at the end
+    return [...completed, ...current]
+  })
+
   const lastAssistant = createMemo(() => {
     return messages().findLast((x) => x.role === "assistant")
   })
@@ -210,6 +257,7 @@ export function Session() {
         })
       }
     }
+
   })
 
   function toBottom() {
@@ -848,7 +896,8 @@ export function Session() {
               flexGrow={1}
               scrollAcceleration={scrollAcceleration()}
             >
-              <For each={messages()}>
+              {/* Active messages: current task and completed messages */}
+              <For each={activeMessages()}>
                 {(message, index) => (
                   <Switch>
                     <Match when={message.id === revert()?.messageID}>
@@ -916,22 +965,38 @@ export function Session() {
                       <></>
                     </Match>
                     <Match when={message.role === "user"}>
-                      <UserMessage
-                        index={index()}
-                        onMouseUp={() => {
-                          if (renderer.getSelection()?.getSelectedText()) return
-                          dialog.replace(() => (
-                            <DialogMessage
-                              messageID={message.id}
-                              sessionID={route.sessionID}
-                              setPrompt={(promptInfo) => prompt.set(promptInfo)}
-                            />
-                          ))
-                        }}
-                        message={message as UserMessage}
-                        parts={sync.data.part[message.id] ?? []}
-                        pending={pending()}
-                      />
+                      <>
+                        {/* Show separator before the currently processing task when there are prior messages */}
+                        <Show when={message.id === currentUserMessageId() && index() > 0}>
+                          <box
+                            marginTop={1}
+                            marginBottom={1}
+                            borderColor={theme.border}
+                            border={["top"]}
+                            paddingTop={1}
+                          >
+                            <text fg={theme.textMuted} paddingLeft={2}>
+                              Processing next task...
+                            </text>
+                          </box>
+                        </Show>
+                        <UserMessage
+                          index={index()}
+                          onMouseUp={() => {
+                            if (renderer.getSelection()?.getSelectedText()) return
+                            dialog.replace(() => (
+                              <DialogMessage
+                                messageID={message.id}
+                                sessionID={route.sessionID}
+                                setPrompt={(promptInfo) => prompt.set(promptInfo)}
+                              />
+                            ))
+                          }}
+                          message={message as UserMessage}
+                          parts={sync.data.part[message.id] ?? []}
+                          pending={pending()}
+                        />
+                      </>
                     </Match>
                     <Match when={message.role === "assistant"}>
                       <AssistantMessage
@@ -944,6 +1009,31 @@ export function Session() {
                 )}
               </For>
             </scrollbox>
+            {/* Queued messages: fixed position just above input, don't scroll with content */}
+            <Show when={queuedMessages().length > 0}>
+              <box flexShrink={0} borderColor={theme.border} border={["top"]} paddingTop={1}>
+                <For each={queuedMessages()}>
+                  {(message, index) => (
+                    <UserMessage
+                      index={activeMessages().length + index()}
+                      onMouseUp={() => {
+                        if (renderer.getSelection()?.getSelectedText()) return
+                        dialog.replace(() => (
+                          <DialogMessage
+                            messageID={message.id}
+                            sessionID={route.sessionID}
+                            setPrompt={(promptInfo) => prompt.set(promptInfo)}
+                          />
+                        ))
+                      }}
+                      message={message as UserMessage}
+                      parts={sync.data.part[message.id] ?? []}
+                      pending={pending()}
+                    />
+                  )}
+                </For>
+              </box>
+            </Show>
             <box flexShrink={0}>
               <Prompt
                 ref={(r) => {
@@ -995,7 +1085,18 @@ function UserMessage(props: {
   const sync = useSync()
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
-  const queued = createMemo(() => props.pending && props.message.id > props.pending)
+  // A message is queued if there's a pending task (any assistant without time.completed)
+  // AND this user message has no response yet. This correctly handles the case where
+  // message B is processing and message C is waiting - C should show as QUEUED even though
+  // C's ID may be lower than B's assistant response ID.
+  const queued = createMemo(() => {
+    if (!props.pending) return false
+    const allMessages = sync.data.message[props.message.sessionID] ?? []
+    const hasResponse = allMessages.some(
+      (m) => m.role === "assistant" && m.parentID === props.message.id,
+    )
+    return !hasResponse
+  })
   const color = createMemo(() => (queued() ? theme.accent : local.agent.color(props.message.agent)))
 
   const compaction = createMemo(() => props.parts.find((x) => x.type === "compaction"))

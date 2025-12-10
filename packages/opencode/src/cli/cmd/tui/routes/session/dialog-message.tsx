@@ -1,10 +1,11 @@
 import { createMemo } from "solid-js"
 import { useSync } from "@tui/context/sync"
-import { DialogSelect } from "@tui/ui/dialog-select"
+import { DialogSelect, type DialogSelectOption } from "@tui/ui/dialog-select"
 import { useSDK } from "@tui/context/sdk"
 import { useRoute } from "@tui/context/route"
 import { Clipboard } from "@tui/util/clipboard"
 import type { PromptInfo } from "@tui/component/prompt/history"
+import { SessionPrompt } from "@/session/prompt"
 
 export function DialogMessage(props: {
   messageID: string
@@ -16,78 +17,111 @@ export function DialogMessage(props: {
   const message = createMemo(() => sync.data.message[props.sessionID]?.find((x) => x.id === props.messageID))
   const route = useRoute()
 
-  return (
-    <DialogSelect
-      title="Message Actions"
-      options={[
-        {
-          title: "Revert",
-          value: "session.revert",
-          description: "undo messages and file changes",
-          onSelect: (dialog) => {
-            const msg = message()
-            if (!msg) return
+  // Check if this message is queued (has no assistant response yet)
+  const isQueued = createMemo(() => {
+    const msg = message()
+    if (!msg || msg.role !== "user") return false
+    const allMessages = sync.data.message[props.sessionID] ?? []
+    const hasResponse = allMessages.some((m) => m.role === "assistant" && m.parentID === msg.id)
+    return !hasResponse
+  })
 
-            sdk.client.session.revert({
-              sessionID: props.sessionID,
-              messageID: msg.id,
-            })
+  // Find the queue position for this message (1-indexed)
+  const queuePosition = createMemo(() => {
+    if (!isQueued()) return 0
+    const queuedIds = SessionPrompt.getQueuedMessageIds(props.sessionID)
+    const index = queuedIds.indexOf(props.messageID)
+    return index >= 0 ? index + 1 : 0
+  })
 
-            if (props.setPrompt) {
-              const parts = sync.data.part[msg.id]
-              const promptInfo = parts.reduce(
-                (agg, part) => {
-                  if (part.type === "text") {
-                    if (!part.synthetic) agg.input += part.text
-                  }
-                  if (part.type === "file") agg.parts.push(part)
-                  return agg
-                },
-                { input: "", parts: [] as PromptInfo["parts"] },
-              )
-              props.setPrompt(promptInfo)
-            }
+  const options = createMemo(() => {
+    const opts: DialogSelectOption[] = []
 
-            dialog.clear()
-          },
+    // Add cancel option for queued messages
+    if (isQueued() && queuePosition() > 0) {
+      opts.push({
+        title: "Cancel",
+        value: "queue.cancel",
+        description: "remove from queue",
+        onSelect: (dialog) => {
+          SessionPrompt.cancelQueued(props.sessionID, queuePosition())
+          dialog.clear()
         },
-        {
-          title: "Copy",
-          value: "message.copy",
-          description: "copy message text to clipboard",
-          onSelect: async (dialog) => {
-            const msg = message()
-            if (!msg) return
+      })
+    }
 
+    opts.push(
+      {
+        title: "Revert",
+        value: "session.revert",
+        description: "undo messages and file changes",
+        onSelect: (dialog) => {
+          const msg = message()
+          if (!msg) return
+
+          sdk.client.session.revert({
+            sessionID: props.sessionID,
+            messageID: msg.id,
+          })
+
+          if (props.setPrompt) {
             const parts = sync.data.part[msg.id]
-            const text = parts.reduce((agg, part) => {
-              if (part.type === "text" && !part.synthetic) {
-                agg += part.text
-              }
-              return agg
-            }, "")
+            const promptInfo = parts.reduce(
+              (agg, part) => {
+                if (part.type === "text") {
+                  if (!part.synthetic) agg.input += part.text
+                }
+                if (part.type === "file") agg.parts.push(part)
+                return agg
+              },
+              { input: "", parts: [] as PromptInfo["parts"] },
+            )
+            props.setPrompt(promptInfo)
+          }
 
-            await Clipboard.copy(text)
-            dialog.clear()
-          },
+          dialog.clear()
         },
-        {
-          title: "Fork",
-          value: "session.fork",
-          description: "create a new session",
-          onSelect: async (dialog) => {
-            const result = await sdk.client.session.fork({
-              sessionID: props.sessionID,
-              messageID: props.messageID,
-            })
-            route.navigate({
-              sessionID: result.data!.id,
-              type: "session",
-            })
-            dialog.clear()
-          },
+      },
+      {
+        title: "Copy",
+        value: "message.copy",
+        description: "copy message text to clipboard",
+        onSelect: async (dialog) => {
+          const msg = message()
+          if (!msg) return
+
+          const parts = sync.data.part[msg.id]
+          const text = parts.reduce((agg, part) => {
+            if (part.type === "text" && !part.synthetic) {
+              agg += part.text
+            }
+            return agg
+          }, "")
+
+          await Clipboard.copy(text)
+          dialog.clear()
         },
-      ]}
-    />
-  )
+      },
+      {
+        title: "Fork",
+        value: "session.fork",
+        description: "create a new session",
+        onSelect: async (dialog) => {
+          const result = await sdk.client.session.fork({
+            sessionID: props.sessionID,
+            messageID: props.messageID,
+          })
+          route.navigate({
+            sessionID: result.data!.id,
+            type: "session",
+          })
+          dialog.clear()
+        },
+      },
+    )
+
+    return opts
+  })
+
+  return <DialogSelect title="Message Actions" options={options()} />
 }

@@ -65,6 +65,7 @@ export namespace SessionPrompt {
           abort: AbortController
           loopId: string
           callbacks: {
+            userMessageID: string
             resolve(input: MessageV2.WithParts): void
             reject(): void
           }[]
@@ -206,7 +207,8 @@ export namespace SessionPrompt {
       return message
     }
 
-    return loop(input.sessionID)
+    // Pass the user message ID so we get the response to THIS message
+    return loop(input.sessionID, message.info.id)
   })
 
   function start(sessionID: string) {
@@ -235,32 +237,101 @@ export namespace SessionPrompt {
     delete s[sessionID]
     SessionStatus.set(sessionID, { type: "idle" })
 
-    // If there were queued requests, restart the loop to handle pending messages
+    // If there were queued requests, process them one at a time from oldest to newest
     if (pendingCallbacks.length > 0) {
-      loop(sessionID)
-        .then((result) => {
-          for (const cb of pendingCallbacks) {
-            cb.resolve(result)
-          }
-        })
-        .catch(() => {
-          for (const cb of pendingCallbacks) {
-            cb.reject()
-          }
-        })
+      processQueuedCallbacks(sessionID, pendingCallbacks)
     }
   }
 
-  export const loop = fn(Identifier.schema("session"), async (sessionID) => {
+  // Cancel a specific queued message by its position in the queue (1-indexed)
+  export function cancelQueued(sessionID: string, queuePosition: number): boolean {
+    log.info("cancelQueued", { sessionID, queuePosition })
+    const s = state()
+    const match = s[sessionID]
+    if (!match) return false
+
+    const index = queuePosition - 1 // Convert 1-indexed to 0-indexed
+    if (index < 0 || index >= match.callbacks.length) return false
+
+    // Remove the callback at the specified position
+    const [removed] = match.callbacks.splice(index, 1)
+    if (removed) {
+      removed.reject()
+      return true
+    }
+    return false
+  }
+
+  // Get the list of queued message IDs for a session
+  export function getQueuedMessageIds(sessionID: string): string[] {
+    const s = state()
+    const match = s[sessionID]
+    if (!match) return []
+    return match.callbacks.map((cb) => cb.userMessageID)
+  }
+
+  // Process queued callbacks one at a time, ensuring messages are handled in order.
+  // Remaining callbacks are added to state so they remain visible as "queued" in the UI.
+  function processQueuedCallbacks(
+    sessionID: string,
+    pendingCallbacks: {
+      userMessageID: string
+      resolve(input: MessageV2.WithParts): void
+      reject(): void
+    }[],
+  ) {
+    if (pendingCallbacks.length === 0) return
+
+    // Take the oldest callback (first in the array)
+    const [first, ...remaining] = pendingCallbacks
+
+    // Start the loop for the first callback
+    const loopPromise = loop(sessionID, first.userMessageID)
+
+    // Add remaining callbacks to state so they're visible as queued in the UI.
+    // This must happen after loop() calls start() which creates the state entry.
+    // When this loop ends, cancel() will pick up these callbacks and process them.
+    if (remaining.length > 0) {
+      const s = state()
+      if (s[sessionID]) {
+        s[sessionID].callbacks = remaining
+      }
+    }
+
+    loopPromise
+      .then((result) => {
+        first.resolve(result)
+        // Remaining callbacks are now in state and will be processed by cancel() when this loop ends
+      })
+      .catch(() => {
+        first.reject()
+        // Remaining callbacks are now in state and will be processed by cancel() when this loop ends
+      })
+  }
+
+  export async function loop(sessionID: string, waitForUserMessageID?: string) {
     const startResult = start(sessionID)
     if (!startResult) {
+      // Session is busy, queue this request
+      // Find the latest user message ID to track what this callback is waiting for
+      const userMessageID =
+        waitForUserMessageID ??
+        (await (async () => {
+          for await (const item of MessageV2.stream(sessionID)) {
+            if (item.info.role === "user") return item.info.id
+          }
+          return ""
+        })())
+
       return new Promise<MessageV2.WithParts>((resolve, reject) => {
         const callbacks = state()[sessionID].callbacks
-        callbacks.push({ resolve, reject })
+        callbacks.push({ userMessageID, resolve, reject })
       })
     }
 
     const { signal: abort, loopId } = startResult
+    // Track the user message ID we're processing for this loop iteration
+    const targetUserMessageID = waitForUserMessageID
     using _ = defer(() => cancel(sessionID, loopId))
 
     let step = 0
@@ -269,6 +340,31 @@ export namespace SessionPrompt {
       log.info("loop", { step, sessionID })
       if (abort.aborted) break
       let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+
+      // For queued messages, filter to only include messages up to and including the target,
+      // plus any assistant responses to those messages. This ensures each queued message
+      // processes with the correct context (as if it was submitted fresh after prior tasks completed).
+      if (targetUserMessageID) {
+        const targetIndex = msgs.findIndex((m) => m.info.id === targetUserMessageID)
+        if (targetIndex !== -1) {
+          // Collect IDs of all user messages up to and including the target
+          const includedUserIds = new Set<string>()
+          for (let i = 0; i <= targetIndex; i++) {
+            if (msgs[i].info.role === "user") {
+              includedUserIds.add(msgs[i].info.id)
+            }
+          }
+
+          // Filter messages to include:
+          // 1. All messages up to and including target index
+          // 2. Assistant responses to any included user messages (may have later IDs due to async)
+          msgs = msgs.filter((m, i) => {
+            if (i <= targetIndex) return true
+            if (m.info.role === "assistant" && includedUserIds.has(m.info.parentID)) return true
+            return false
+          })
+        }
+      }
 
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
@@ -288,12 +384,19 @@ export namespace SessionPrompt {
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
-      if (
-        lastAssistant?.finish &&
-        !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-        lastUser.id < lastAssistant.id
-      ) {
-        log.info("exiting loop", { sessionID })
+
+      // Exit condition: check if the last user message has a completed (non-tool-call) response
+      // This is more accurate than comparing IDs, which can fail when assistant responses
+      // to earlier messages have higher IDs due to async processing
+      const lastUserResponse = msgs.findLast(
+        (m) =>
+          m.info.role === "assistant" &&
+          m.info.parentID === lastUser!.id &&
+          (m.info as MessageV2.Assistant).finish &&
+          !["tool-calls", "unknown"].includes((m.info as MessageV2.Assistant).finish!),
+      )
+      if (lastUserResponse) {
+        log.info("exiting loop - last user message has completed response", { sessionID, lastUserId: lastUser.id })
         break
       }
 
@@ -660,16 +763,23 @@ export namespace SessionPrompt {
       continue
     }
     SessionCompaction.prune({ sessionID })
+
+    // If we were waiting for a specific message, find its response
+    if (targetUserMessageID) {
+      for await (const item of MessageV2.stream(sessionID)) {
+        if (item.info.role === "assistant" && item.info.parentID === targetUserMessageID) {
+          return item
+        }
+      }
+    }
+
+    // Otherwise return the latest assistant message
     for await (const item of MessageV2.stream(sessionID)) {
       if (item.info.role === "user") continue
-      const queued = state()[sessionID]?.callbacks ?? []
-      for (const q of queued) {
-        q.resolve(item)
-      }
       return item
     }
     throw new Error("Impossible")
-  })
+  }
 
   async function lastModel(sessionID: string) {
     for await (const item of MessageV2.stream(sessionID)) {
