@@ -890,7 +890,7 @@ export namespace Server {
         ),
         async (c) => {
           const { sessionID, messageID } = c.req.valid("param")
-          const result = SessionPrompt.cancelQueuedMessage(sessionID, messageID)
+          const result = await SessionPrompt.cancelQueuedMessage(sessionID, messageID)
           return c.json(result)
         },
       )

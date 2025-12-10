@@ -360,6 +360,11 @@ export namespace Session {
       messageID: Identifier.schema("message"),
     }),
     async (input) => {
+      // Remove all parts for this message first
+      for (const part of await Storage.list(["part", input.messageID])) {
+        await Storage.remove(part)
+      }
+      // Remove the message itself
       await Storage.remove(["message", input.sessionID, input.messageID])
       Bus.publish(MessageV2.Event.Removed, {
         sessionID: input.sessionID,

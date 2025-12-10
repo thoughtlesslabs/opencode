@@ -243,22 +243,26 @@ export namespace SessionPrompt {
     }
   }
 
-  // Cancel a queued message by its message ID
-  export function cancelQueuedMessage(sessionID: string, messageID: string): boolean {
+  // Cancel a queued message by its message ID - removes from queue AND deletes message
+  export async function cancelQueuedMessage(sessionID: string, messageID: string): Promise<boolean> {
     log.info("cancelQueuedMessage", { sessionID, messageID })
     const s = state()
     const match = s[sessionID]
-    if (!match) return false
 
-    const index = match.callbacks.findIndex((cb) => cb.userMessageID === messageID)
-    if (index === -1) return false
-
-    const [removed] = match.callbacks.splice(index, 1)
-    if (removed) {
-      removed.reject()
-      return true
+    // Remove from callback queue if present
+    if (match) {
+      const index = match.callbacks.findIndex((cb) => cb.userMessageID === messageID)
+      if (index !== -1) {
+        const [removed] = match.callbacks.splice(index, 1)
+        if (removed) {
+          removed.reject()
+        }
+      }
     }
-    return false
+
+    // Delete the message from storage entirely
+    await Session.removeMessage({ sessionID, messageID })
+    return true
   }
 
   // Process queued callbacks one at a time, ensuring messages are handled in order.

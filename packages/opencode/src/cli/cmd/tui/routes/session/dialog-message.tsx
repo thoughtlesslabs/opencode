@@ -48,21 +48,16 @@ export function DialogMessage(props: {
   const options = createMemo(() => {
     const opts: DialogSelectOption[] = []
 
-    // Add cancel option for queued messages
+    // Add cancel option for queued messages - deletes message entirely
     if (isQueued() && queuePosition() > 0) {
       opts.push({
         title: "Cancel",
         value: "queue.cancel",
         description: "remove from queue",
         onSelect: async (dialog) => {
-          // Cancel the queued message via API
+          // Cancel the queued message - removes from queue and deletes message
           await sdk.client.client.post({
             url: `/session/${props.sessionID}/queue/${props.messageID}/cancel`,
-          })
-          // Also revert the message to remove it from the UI
-          sdk.client.session.revert({
-            sessionID: props.sessionID,
-            messageID: props.messageID,
           })
           dialog.clear()
         },
